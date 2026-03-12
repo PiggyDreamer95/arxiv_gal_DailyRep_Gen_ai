@@ -8,6 +8,7 @@ import pytz
 MY_API_KEY = "API~"
 MY_BASE_URL = "URL BASE～"
 MY_MODEL = "模型～"
+client = OpenAI(api_key=MY_API_KEY, base_url=MY_BASE_URL)
 # ==========================================
 def get_arxiv_sync_window():
     """精确计算 arXiv 今日公布批次的提交时间窗口"""
