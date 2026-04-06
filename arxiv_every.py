@@ -1,97 +1,160 @@
 ## arXiv 每日同步版日报生成器 --- 作者：朱柏铖 (author:Bocheng Zhu bochengzhu@outlook.com)
 import arxiv
-import datetime
 from openai import OpenAI
-from datetime import timedelta
 import pytz
+import requests
+import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+import time
+import datetime
+import random
 # ==========================================
-MY_API_KEY = "API~"
-MY_BASE_URL = "URL BASE～"
-MY_MODEL = "模型～"
+MY_API_KEY = "你的api密钥" 
+MY_BASE_URL = "你的baseURL"
+MY_MODEL = "你的模型@@"
 client = OpenAI(api_key=MY_API_KEY, base_url=MY_BASE_URL)
-# ==========================================
-def get_arxiv_sync_window():
-    """精确计算 arXiv 今日公布批次的提交时间窗口"""
-    tz_et = pytz.timezone('US/Eastern')
-    now_et = datetime.datetime.now(tz_et)
-    
-    # arXiv 更新规则：周四的 New 列表来自周三 14:00 前的 24 小时提交
-    # 周一的 New 列表来自上周五 14:00 前的提交
-    weekday = now_et.weekday() 
-    if weekday == 0: # Monday
-        days_back = 3
-    elif weekday in [5, 6]: # Weekend
-        days_back = 0
-    else:
-        days_back = 1
-        
-    # 窗口结束点：昨天 14:00 ET
-    end_time = now_et.replace(hour=14, minute=0, second=0, microsecond=0) - timedelta(days=1)
-    # 窗口起始点：再往前推 24h (或周一对应的 72h)
-    start_time = end_time - timedelta(days=days_back)
-    
-    return start_time, end_time
 
 def fetch_arxiv_papers():
-    start_t, end_t = get_arxiv_sync_window()
-    print(f"🔍 正在同步 arXiv 公告批次 (提交时间窗口: {start_t.strftime('%m-%d %H:%M')} -> {end_t.strftime('%m-%d %H:%M')} ET)")
+    url = 'https://arxiv.org/list/astro-ph.GA/recent'
+    headers = {
+        # 伪装成浏览器
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+    }
 
-    arxiv_client = arxiv.Client()
-    search = arxiv.Search(query="cat:astro-ph.ga", max_results=60, sort_by=arxiv.SortCriterion.SubmittedDate)
-    
-    papers = []
-    for r in arxiv_client.results(search):
-        pub_et = r.published.astimezone(pytz.timezone('US/Eastern'))
-        if start_t <= pub_et < end_t:
-            papers.append({
-                "title": r.title,
-                "authors": ", ".join([a.name for a in r.authors]),
-                "summary": r.summary,
-                "url": r.entry_id
-            })
-    
-    print(f"✅ 同步成功！抓取到 {len(papers)} 篇论文（应与官网 New 列表数量一致）。")
-    return papers
+    response = requests.get(url, headers=headers, timeout=15)
 
+    # 如果不是 200，说明被墙或者被反爬拦截了
+    response.raise_for_status() 
+
+    # 解析 HTML
+    soup = BeautifulSoup(response.text, 'html.parser')
+    papers_ids = []
+    h3_count = 0  # 记录遇到了几个 h3
+    for element in soup.find_all(['h3', 'dt']):
+        if element.name == 'h3':
+            h3_count += 1
+            if h3_count == 2:
+                # 遇到第二个 h3，说明中间的文章已经抓完了，直接跳出循环
+                break 
+                
+        # 当 h3_count 为 1 时，说明我们正处于两个 h3 之间
+        elif element.name == 'dt' and h3_count == 1:
+            a_tag = element.find('a', title='Abstract')
+            if a_tag:
+                # 提取并清理出纯净的 ID
+                arxiv_id = a_tag.text.replace('arXiv:', '').strip()
+                papers_ids.append(arxiv_id)
+    
+    search = arxiv.Search(id_list=papers_ids)
+    client = arxiv.Client()
+    results = list(client.results(search))
+    details_dict = {}
+    for paper in results:
+        base_id = paper.entry_id.split('/abs/')[-1].split('v')[0]
+        details_dict[base_id] = {
+            "id": paper.entry_id,  
+            "title": paper.title.replace('\n', ' '), # 去掉标题里烦人的换行
+            "authors": ", ".join([author.name for author in paper.authors]), # 把作者列表拼成字符串
+            "summary": paper.summary.replace('\n', ' '), # 去掉摘要里的换行
+        }
+    final_papers = []
+    for pid in papers_ids:
+        if pid in details_dict:
+            final_papers.append(details_dict[pid])
+    return final_papers
+
+def generate_summary(papers):
+    if not papers: return ""
+    
+    papers_content = "\n\n".join([
+    f"[{i+1}] 标题：{p.get('title', '')}\n摘要：{p.get('summary', '')}" 
+    for i, p in enumerate(papers)
+    ])
+    
+    prompt = f"""
+    你是一名资深天文学家。请阅读以下 {len(papers)} 篇论文的【标题与完整摘要】，撰写一段约 400-500字的“今日 arXiv 综述”。
+    核心要求：
+    1. 使用更加易懂的语言，因为阅读的都是大同行，太专业大家看不懂。
+    2. 归纳热点聚类：不要按流水账列举。请将今日的干货提炼为2-4个核心研究热点，每个热点名称使用 <b> 加粗 </b>。
+    3. 独立描述：不同工作内容请并列描述，**严禁为几篇不同的文章生硬捏造因果或递进逻辑链条**。
+    4. 精准引证：在描述具体物理发现时，必须紧跟对应的论文编号，如“模拟结果显示黑洞动能反馈显著压制了冷气体吸积 [3, 15]”。
+    5. 专业排版：纯 HTML 格式输出，最外层使用 <div style="background:#f0f7ff; padding:15px; border-radius:8px; line-height: 1.6; font-size: 15px; color: #333; margin-bottom: 20px;"> 包装。
+    6. 符号规范：绝对不要使用 LaTeX 公式。请使用纯文本或 HTML 支持的常见天文写法（如 M_sun, z~10, Lambda-CDM）。语言必须地道，保留专业名词的英文原词（如 Outflow, Quenching, IMF等）。
+    论文列表：
+    {papers_content}
+    """
+    
+    print("🧠 正在生成今日综述（导读）...")
+    response = client.chat.completions.create(
+        model=MY_MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content
+
+# ================= 修改后的 generate_report 函数 =================
 def generate_report(papers):
     if not papers: return "<p>今日暂无更新。</p>"
     
-    input_text = ""
-    for i, p in enumerate(papers):
-        input_text += f"[{i+1}] Title: {p['title']}\nAuthors: {p['authors']}\nAbstract: {p['summary']}\n\n"
+    # 第一步：生成导读摘要
+    summary_html = generate_summary(papers)
+    
+    # 第二步：生成分类索引
+    index_prompt = "请对以下论文进行【领域归类】，领域不用分的太细，分几个大类即可。只需返回 <h3>一、领域归类</h3> 和分类列表（HTML格式）。\n\n"
+    index_prompt += "\n".join([f"[{i+1}] {p['title']}" for i, p in enumerate(papers)])
+    
+    print("🧠 正在生成索引部分...")
+    index_html = client.chat.completions.create(
+        model=MY_MODEL,
+        messages=[{"role": "user", "content": index_prompt}]
+    ).choices[0].message.content
 
-    prompt = f"""
-    你是一名专业的天文学公众号主编且资深天文学家。请处理以下 {len(papers)} 篇论文，严格按以下格式输出 HTML：
+    # 第三步：分批生成详情（降低步长至 5，确保不被截断）
+    print(f"🧠 正在分段生成 {len(papers)} 篇论文详情...")
+    details_html = "<h3>二、论文条目 (Details Section)</h3>"
+    
+    batch_size = 5 # ⬅️ 缩小步长，每组 5 篇最安全
+    for i in range(0, len(papers), batch_size):
+        batch = papers[i : i + batch_size]
+        current_range = f"{i+1} 到 {min(i + batch_size, len(papers))}"
+        print(f"   👉 正在处理第 {current_range} 篇...")
+        
+        batch_text = ""
+        for j, p in enumerate(batch):
+            batch_text += f"[{i+j+1}] Title: {p['title']}\nLink: {p['id']}\nAuthors: {p['authors']}\nAbstract: {p['summary']}\n\n"
 
-    一、领域归类 (Index Section)
-    按领域（如：引力与动力学、星团、星系演化、AGN等）分类，在每个类别后列出对应的论文编号。
-    格式示例：领域名称：[1], [5], [12]
+        # 注意：这里的 prompt 修正了数量描述
+        details_prompt = f"""
+        你是一名专业的天文学家。请处理以下编号为 [{current_range}] 的 {len(batch)} 篇论文，按 HTML 格式输出：
+        
+        每篇格式：
+        [编号] 中文标题
+        链接：论文链接
+        作者：[仅提取前十个作者，多余的使用(et al.)"]
+        研究方法：[严格从 Observation / Simulation / Theory / Methods / Review 中选择 1-2 个]。
+        核心问题：严格限制 1 句话，20 字以内，一针见血说明在问什么
+        核心物理结果：使用易懂通俗的语言，表达短小精悍。严禁使用‘本文研究了...’这种废话。请直接描述物理发现，例如：‘发现星系旋转曲线在 R > 20kpc 处依然平坦，暗示暗物质晕比例高于预期。’，使用 2-3 句地道的中文学术表达。保留希腊字母(α, β, σ)和太阳符号(M☉)。语言必须地道，保留专业名词的英文原词（如 Outflow, Quenching, IMF等）。
 
-    二、论文条目 (Details Section)
-    按编号顺序排列所有 {len(papers)} 篇论文。
-    每篇格式：
-    [编号] 中文标题
-    作者：姓名全称（若有天文模拟、观测、理论、方法等领域的著名学者，请用 <strong style="color:#d35400;">姓名 ★(Famous Scholar)</strong>）
-    研究方法：[需判定为 Observation / Simulation / Theory / Methods 之一]。判定标准：若文章核心是发布新数据或巡天样本，请标为 [Observation]；若核心是算法改进或软件评测，请标为 [Methods]。
-    核心物理结果：严禁使用‘本文研究了...’这种废话。请直接描述物理发现，例如：‘发现星系旋转曲线在 R > 20kpc 处依然平坦，暗示暗物质晕比例高于预期。’，使用 2-3 句地道的中文学术表达。保留希腊字母(α, β, σ)和太阳符号(M☉)。
+        要求：
+        - 只返回这 {len(batch)} 篇论文的内容。
+        - 严禁 Markdown 符号（如 ##, **），必须使用纯 HTML 标签 (<h3>, <ul>, <li>, <p>, <strong>)。
+        - 只返回 <body> 内部内容。
 
-    要求：
-    - 严禁 Markdown 符号（如 ##, **），必须使用纯 HTML 标签 (<h3>, <ul>, <li>, <p>, <strong>)。
-    - 只返回 <body> 内部内容。
+        待处理论文：
+        {batch_text}
+        """
+        
+        try:
+            response = client.chat.completions.create(
+                model=MY_MODEL,
+                messages=[{"role": "user", "content": details_prompt}]
+            )
+            # 清理 AI 可能带出来的 markdown 代码块标识
+            chunk = response.choices[0].message.content.replace('```html', '').replace('```', '')
+            details_html += chunk
+        except Exception as e:
+            print(f"❌ 处理批次 {current_range} 时出错: {e}")
 
-    待处理论文：
-    {input_text}
-    """
-
-    print("🧠 Claude 正在按照“索引+详情”模式进行排版...")
-    try:
-        response = client.chat.completions.create(
-            model=MY_MODEL,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"Error: {e}"
+    return summary_html + index_html + details_html
 
 def save_html(content, lenpapers):
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -111,14 +174,14 @@ def save_html(content, lenpapers):
 </head>
 <body>
     <div class="header">
-        <h2 style="margin:0;">🌌 星系物理与动力学日报</h2>
+        <h2 style="margin:0;">🌌 星系天文arxiv日报</h2>
         <p>{date_str} | 今日同步更新 {lenpapers} 篇</p>
     </div>
     {content.replace('```html', '').replace('```', '')}
 </body>
 </html>"""
     
-    filename = f"GA_Sync_Report_{date_str}.html"
+    filename = f"GA_opus_Report_{date_str}.html"
     with open(filename, "w", encoding="utf-8-sig") as f:
         f.write(html_layout)
     print(f"✨ 同步版日报（索引+详情）已生成：{filename}")
